@@ -1,0 +1,12 @@
+# Time-boxed waivers, loaded by conftest as data.exceptions.
+# A waiver needs a rule, a resource address (globs allowed), a reason, an
+# approver and an expiry. Expired waivers stop applying on their own, so
+# nothing is waived forever by accident.
+#
+# Example:
+# - rule: CHG-001
+#   address: module.baseline.module.data_bucket.aws_s3_bucket.this
+#   reason: Migrating to a new bucket name, data copied in CHG-1234
+#   approved_by: platform-lead
+#   expires: "2026-11-30T00:00:00Z"
+exceptions: []

@@ -1,0 +1,185 @@
+name: ci
+
+# Every pull request, with no AWS account needed:
+#   static        terraform fmt / validate / tflint on every root and module
+#   module-tests  terraform test (mocked provider) for each module
+#   policy-tests  OPA unit tests with a coverage floor
+#   checkov       second, independent security scanner
+#   policy-gate   plan each environment offline and enforce the guardrails
+#   regression    prove the guardrails still catch a deliberately bad config
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.16.7"
+  TFLINT_VERSION: "v0.65.0"
+  OPA_VERSION: "1.21.3"
+  CONFTEST_VERSION: "0.71.1"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: tflint plugins
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: validate and lint every root and module
+        run: |
+          status=0
+          for dir in modules/* stacks/baseline envs/* bootstrap; do
+            echo "::group::$dir"
+            (
+              cd "$dir"
+              terraform init -backend=false -input=false -no-color >/dev/null
+              terraform validate -no-color
+              tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+            ) || { echo "::error::$dir failed"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+
+  module-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [iam-role, kms-key, secure-bucket, security-group, vpc]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform test
+        working-directory: modules/${{ matrix.module }}
+        run: |
+          terraform init -input=false -no-color >/dev/null
+          terraform test -no-color
+
+  policy-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: opa fmt
+        run: opa fmt --list --fail policies
+
+      - name: opa check
+        run: opa check --strict policies/terraform policies/tests
+
+      - name: opa test (fail under 90% coverage)
+        run: |
+          opa test policies/terraform policies/tests -v
+          opa test policies/terraform policies/tests --coverage --threshold 90 --format json > coverage.json
+          python3 -c "import json; print('Policy coverage: %.1f%%' % json.load(open('coverage.json'))['coverage'])" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  checkov:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # publish results to the Security tab
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          config_file: .checkov.yaml
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+        continue-on-error: true
+
+  policy-gate:
+    needs: [static, policy-tests]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { root: envs/dev, env: dev }
+          - { root: envs/staging, env: staging }
+          - { root: envs/prod, env: prod }
+          - { root: bootstrap, env: shared }
+    name: policy-gate (${{ matrix.env }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install conftest
+        run: |
+          curl -sSfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin conftest
+
+      - name: Plan offline and enforce guardrails
+        run: scripts/policy-check.sh ${{ matrix.root }} ${{ matrix.env }} --offline
+
+      - name: Keep the plan JSON
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan-${{ matrix.env }}
+          path: .policy-output/
+          retention-days: 14
+
+  regression:
+    needs: [policy-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install conftest
+        run: |
+          curl -sSfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin conftest
+
+      - name: Guardrails still catch a deliberately insecure config
+        run: scripts/regression-check.sh

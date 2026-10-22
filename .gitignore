@@ -1,0 +1,18 @@
+# Terraform / OpenTofu
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+backend.hcl
+ci_override.tf
+!ci/ci_override.tf
+.terraform.tfstate.lock.info
+
+# Policy run output
+.policy-output/
+
+# Misc
+.DS_Store
+.env

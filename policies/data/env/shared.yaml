@@ -1,0 +1,12 @@
+# Guardrail settings for bootstrap (shared, account-level resources)
+guardrails:
+  environment: shared
+  allowed_regions: [us-east-1]
+  required_tags: [Project, Environment, Owner, CostCenter]
+  require_kms_for_s3: true
+  require_versioning: true
+  min_azs: 1
+  min_kms_deletion_window_days: 30
+  protect_stateful_resources: true
+  public_ingress_ports: [443]
+  allowed_instance_types: []

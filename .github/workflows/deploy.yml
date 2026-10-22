@@ -1,0 +1,51 @@
+name: deploy
+
+# Promotion: dev -> staging -> prod, one after another, only from main.
+# Each job runs in a GitHub Environment of the same name; give "prod" required
+# reviewers so a human approves before anything changes in production.
+#
+# The real plan is checked against the guardrails again before apply. Unlike
+# the offline PR check, this plan sees existing state, so CHG-001 can catch a
+# change that would delete or replace a production bucket or key.
+#
+# Stays skipped until you set the repository variable DEPLOY_ENABLED=true
+# (see README "Deploy from GitHub Actions").
+on:
+  push:
+    branches: [main]
+    paths:
+      - "envs/**"
+      - "stacks/**"
+      - "modules/**"
+      - "policies/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC -> AWS, no stored keys
+
+concurrency:
+  group: deploy # never two applies at once
+  cancel-in-progress: false
+
+jobs:
+  dev:
+    if: vars.DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: dev
+    secrets: inherit
+
+  staging:
+    needs: dev
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: staging
+    secrets: inherit
+
+  prod:
+    needs: staging
+    uses: ./.github/workflows/deploy-env.yml
+    with:
+      environment: prod
+    secrets: inherit

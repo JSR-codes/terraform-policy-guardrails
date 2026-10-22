@@ -1,0 +1,18 @@
+# Checks skipped repo-wide, with the reason. Resource-specific skips live
+# next to the resource as #checkov:skip comments.
+framework:
+  - terraform
+skip-path:
+  - examples/noncompliant # deliberately insecure test fixture
+skip-check:
+  # S3 server access logs can't be delivered to an SSE-KMS bucket; use
+  # CloudTrail S3 data events for object-level auditing instead.
+  - CKV_AWS_18
+  # Cross-region replication doubles storage cost; it belongs to the
+  # disaster-recovery project, not this baseline.
+  - CKV_AWS_144
+  # Event notifications are workload-specific, not a baseline control.
+  - CKV2_AWS_62
+  # The app security group is created here and attached by workloads that
+  # are deployed separately.
+  - CKV2_AWS_5

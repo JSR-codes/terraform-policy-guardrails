@@ -1,0 +1,55 @@
+name: deploy-env
+
+# Reusable: plan one environment against real state, enforce the guardrails
+# on that plan, then apply exactly that plan.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      TF_VERSION: "1.16.7"
+      CONFTEST_VERSION: "0.71.1"
+      TF_IN_AUTOMATION: "true"
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install conftest
+        run: |
+          curl -sSfL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin conftest
+
+      # The role trusts only repo:<owner>/<repo>:environment:<env>
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.TF_STATE_REGION }}
+
+      - name: Plan and enforce guardrails
+        env:
+          PLAN_OUT: ${{ runner.temp }}/tfplan
+        run: scripts/policy-check.sh envs/${{ inputs.environment }} ${{ inputs.environment }}
+
+      - name: Apply the approved plan
+        working-directory: envs/${{ inputs.environment }}
+        run: |
+          start=$(date +%s)
+          terraform apply -input=false -no-color "${{ runner.temp }}/tfplan"
+          echo "Applied **${{ inputs.environment }}** in $(( $(date +%s) - start ))s" >> "$GITHUB_STEP_SUMMARY"

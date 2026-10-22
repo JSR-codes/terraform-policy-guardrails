@@ -1,0 +1,12 @@
+# Guardrail settings for staging, loaded by conftest as data.guardrails
+guardrails:
+  environment: staging
+  allowed_regions: [us-east-1]
+  required_tags: [Project, Environment, Owner, CostCenter]
+  require_kms_for_s3: true
+  require_versioning: true
+  min_azs: 2
+  min_kms_deletion_window_days: 30
+  protect_stateful_resources: true
+  public_ingress_ports: [80, 443]
+  allowed_instance_types: [t3.small, t3.medium, t3.large, m7i.large, m7g.large]

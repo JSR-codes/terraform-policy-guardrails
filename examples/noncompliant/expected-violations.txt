@@ -1,0 +1,21 @@
+# Rule IDs that MUST fire when examples/noncompliant is checked with prod settings.
+# CHG-001 is covered by unit tests: it needs existing state to delete.
+TAG-001
+TAG-002
+S3-001
+S3-002
+S3-003
+S3-004
+NET-001
+NET-002
+NET-003
+IAM-001
+IAM-002
+IAM-003
+IAM-004
+IAM-005
+KMS-001
+KMS-002
+EC2-001
+EC2-002
+REG-001
