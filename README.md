@@ -1,169 +1,143 @@
-# Terraform Policy Guardrails
-
-Reusable AWS Terraform modules, three environments built from them, and **policy as code** that blocks insecure or non-compliant infrastructure before it reaches AWS: on every pull request, and again right before each deploy.
+# terraform-policy-guardrails
 
 [![ci](https://github.com/JSR-codes/terraform-policy-guardrails/actions/workflows/ci.yml/badge.svg)](https://github.com/JSR-codes/terraform-policy-guardrails/actions/workflows/ci.yml)
-[![deploy](https://github.com/JSR-codes/terraform-policy-guardrails/actions/workflows/deploy.yml/badge.svg)](https://github.com/JSR-codes/terraform-policy-guardrails/actions/workflows/deploy.yml)
 
-**At a glance**
+I built this to practice something most platform teams end up needing: a way to stop bad infrastructure changes *before* they get applied, instead of finding them later in a security review.
 
-- 5 tested modules (VPC, secure S3 bucket, KMS key, IAM role, security group), composed into one baseline stack
-- dev / staging / prod that differ only in settings, with S3-native state locking (no DynamoDB)
-- 24 OPA/Rego rules (22 blocking, 2 warnings) evaluated against the real Terraform plan, with **environment-specific** strictness
-- 66 policy unit tests at 99% coverage, plus 23 module tests
-- A deliberately insecure example that CI must reject, proving every rule still fires
-- Pull requests are policy-checked **without AWS credentials** (offline plan)
-- Deploys use GitHub OIDC, run dev → staging → prod, and prod waits for approval
+The repo has a small set of Terraform modules for AWS, three environments (dev, staging, prod) built from those modules, and a set of OPA/Rego policies that check every Terraform plan. If a change opens SSH to the internet, creates an unencrypted bucket, or gives a role `*:*`, the pull request fails and tells you exactly which resource broke which rule.
 
-## How it works
+## The basic idea
 
-```mermaid
-flowchart LR
-    pr([Pull request]) --> static["fmt · validate · tflint"]
-    pr --> mt["terraform test<br/>per module"]
-    pr --> pt["opa test<br/>66 tests, ≥90% coverage"]
-    pr --> ck["Checkov"]
-    static & pt --> gate
-    subgraph gate["Policy gate (no AWS account needed)"]
-        direction TB
-        plan["terraform plan<br/>fake creds, local state"] --> json["plan.json"] --> conf["conftest<br/>+ env settings"]
-    end
-    pt --> reg["Regression:<br/>insecure example<br/>must fail 19 rules"]
-    gate --> merge([Merge to main])
-    merge --> dev["dev"] --> stg["staging"] --> appr{{"Approval"}} --> prod["prod"]
-    subgraph deploy["Each deploy: OIDC role → real plan → guardrails again → apply that exact plan"]
-        dev
-        stg
-        prod
-    end
+Checkov and similar scanners read the `.tf` files. That's useful, but the code doesn't tell you everything. Variables, module inputs and provider defaults are only resolved at plan time. So I run the policies against the plan instead:
+
+```
+terraform plan -out tfplan
+terraform show -json tfplan > plan.json
+conftest test plan.json   # with the settings for that environment
 ```
 
-### Defence in depth
+Because the policies see the real plan, the same rule can behave differently per environment. Prod needs 3 AZs, only allows port 443 from the internet, and blocks deleting buckets or KMS keys. Dev is more relaxed.
 
-Each layer catches what the one before it can't see:
+The part I like most: **pull requests don't need AWS credentials**. None of the modules use data sources that call AWS, so CI copies in `ci/ci_override.tf` (local state, fake credentials) and gets a complete plan with no account at all. The deploy pipeline then plans again against real state and runs the same checks before applying.
 
-| Layer | When | Catches |
+Rough flow:
+
+```
+PR opened
+  ├── fmt / validate / tflint
+  ├── terraform test on each module
+  ├── opa test on the policies
+  ├── checkov
+  ├── offline plan of dev, staging, prod, bootstrap → conftest
+  └── plan of examples/noncompliant → must FAIL (proves the rules still work)
+
+merged to main
+  └── dev → staging → (manual approval) → prod
+        each step: OIDC role → real plan → conftest → apply that same plan
+```
+
+## What's in here
+
+```
+modules/           vpc, secure-bucket, kms-key, iam-role, security-group (each has tests/)
+stacks/baseline/   what every environment gets, built from the modules
+envs/              dev, staging, prod: same code, different terraform.tfvars
+bootstrap/         state bucket + GitHub OIDC roles, run once by hand
+policies/          Rego rules, unit tests, per-env settings, waivers
+examples/noncompliant/   intentionally insecure, used as a regression test
+scripts/           policy-check.sh and regression-check.sh
+```
+
+A few choices in the modules that are deliberate:
+
+- `secure-bucket` has no option to turn off encryption or make the bucket public. If you need that, you shouldn't be using this module.
+- `iam-role` requires a permissions boundary. There's no default, so you can't forget it.
+- `kms-key` always has rotation on.
+- `vpc` ships flow logs (KMS-encrypted) and strips all rules from the default security group.
+
+## The rules
+
+| Rule | Checks | Differs by env? |
 |---|---|---|
-| Module input validation | `terraform plan` | Bad inputs: wrong CIDR size, wildcard trust, missing boundary, lazy SG descriptions |
-| `terraform test` (mocked) | CI | Modules quietly losing a secure default |
-| Checkov | CI | Known misconfigurations in the code, from a second independent rule set |
-| **OPA on the plan** | CI and before every apply | What will *actually* be created, with environment-specific rules |
-| Permissions boundaries | Runtime, in AWS | Anything a role tries that the plan couldn't show (e.g. policies only known after apply) |
-| Bounded deploy role | Runtime, in AWS | The pipeline can only create IAM roles that carry an approved boundary |
+| TAG-001 | Project, Environment, Owner and CostCenter tags are set | |
+| TAG-002 | The Environment tag matches where it's being deployed | |
+| S3-001 | Public access block, all four settings on | |
+| S3-002 | Default encryption with KMS | |
+| S3-003 | Versioning on | |
+| S3-004 | No public canned ACLs | |
+| NET-001 | Only web ports open to 0.0.0.0/0 | dev/staging: 80, 443. prod: 443 only |
+| NET-002 | Every VPC has flow logs | |
+| NET-003 | Subnets spread across enough AZs | prod needs 3, others 2 |
+| IAM-001 | No `Allow *` on `*` | |
+| IAM-002 | Every role has a permissions boundary | |
+| IAM-003 | No trust policy that trusts `*` | |
+| IAM-004 | No IAM users or access keys | |
+| IAM-005 | GitHub OIDC trust is pinned to a repo (no `repo:my-org/*`) | |
+| KMS-001 | Key rotation on | |
+| KMS-002 | Minimum deletion window | 7 days in dev, 30 elsewhere |
+| EC2-001 | Instance type is on the allow-list | small types in dev, bigger in prod |
+| EC2-002 | IMDSv2 required | |
+| REG-001 | Only approved regions | prod also allows us-west-2 |
+| CHG-001 | Deleting/replacing a bucket, key or database | warning in dev, blocked in staging/prod |
+| COST-001 | NAT gateway in dev (it's ~$32/month) | warning only |
+| EXC-001..003 | Waivers have a reason, an approver and a short expiry | |
 
-## Policy catalog
+The env-specific values are in `policies/data/env/*.yaml`, so tightening prod is a one-line change.
 
-| ID | Rule | dev | staging | prod |
-|---|---|---|---|---|
-| TAG-001 | Required tags: Project, Environment, Owner, CostCenter | ✓ | ✓ | ✓ |
-| TAG-002 | `Environment` tag matches the environment being deployed | ✓ | ✓ | ✓ |
-| S3-001 | Public access block with all four settings on | ✓ | ✓ | ✓ |
-| S3-002 | Default encryption with KMS | ✓ | ✓ | ✓ |
-| S3-003 | Versioning enabled | ✓ | ✓ | ✓ |
-| S3-004 | No public canned ACLs | ✓ | ✓ | ✓ |
-| NET-001 | Only web ports open to `0.0.0.0/0` or `::/0` | 80, 443 | 80, 443 | 443 only |
-| NET-002 | Every VPC has flow logs | ✓ | ✓ | ✓ |
-| NET-003 | Subnets span enough Availability Zones | ≥ 2 | ≥ 2 | ≥ 3 |
-| IAM-001 | No `Allow *` on `*` | ✓ | ✓ | ✓ |
-| IAM-002 | Every role has a permissions boundary | ✓ | ✓ | ✓ |
-| IAM-003 | Trust policies never trust `*` | ✓ | ✓ | ✓ |
-| IAM-004 | No IAM users or access keys | ✓ | ✓ | ✓ |
-| IAM-005 | GitHub OIDC trust pins the repo, with no org-wide wildcards | ✓ | ✓ | ✓ |
-| KMS-001 | Key rotation on | ✓ | ✓ | ✓ |
-| KMS-002 | Minimum key deletion window | 7 days | 30 days | 30 days |
-| EC2-001 | Instance type allow-list | t3/t4g small | up to large | m7/c7/r7 large |
-| EC2-002 | IMDSv2 required | ✓ | ✓ | ✓ |
-| REG-001 | Approved regions only (provider and per-resource overrides) | us-east-1 | us-east-1 | + us-west-2 |
-| CHG-001 | Deleting or replacing a bucket, key or database | warn | **block** | **block** |
-| COST-001 | NAT gateway in dev | warn | | |
-| EXC-001/002 | Waivers need reason, approver and an expiry within 90 days | ✓ | ✓ | ✓ |
-| EXC-003 | Expired waiver still in the file | warn | warn | warn |
+Here's some of what you get when the insecure example is checked against prod:
 
-Rules live in [`policies/terraform/`](policies/terraform), per-environment settings in [`policies/data/env/`](policies/data/env).
-
-## What a failure looks like
-
-From `examples/noncompliant` checked against prod (abridged):
-
-```text
-FAIL - terraform.network - [NET-001] aws_security_group.ssh: tcp ports 22-22 open to 0.0.0.0/0; only [443] may face the internet
-FAIL - terraform.iam     - [IAM-005] aws_iam_role.github: GitHub OIDC trust uses wildcard subject "repo:my-org/*"
-FAIL - terraform.kms     - [KMS-002] aws_kms_key.weak: deletion window is 7 days; prod requires at least 30
-FAIL - terraform.network - [NET-003] plan: subnets span 1 AZ(s) ["eu-west-1a"]; prod needs at least 3
-FAIL - terraform.tags    - [TAG-002] aws_vpc.main: Environment tag is "dev" but this is the "prod" environment
+```
+[NET-001] aws_security_group.ssh: tcp ports 22-22 open to 0.0.0.0/0; only [443] may face the internet
+[IAM-005] aws_iam_role.github: GitHub OIDC trust uses wildcard subject "repo:my-org/*"
+[KMS-002] aws_kms_key.weak: deletion window is 7 days; prod requires at least 30
+[NET-003] plan: subnets span 1 AZ(s) ["eu-west-1a"]; prod needs at least 3
 ```
 
-Every message has a rule ID, the exact resource address and the fix. In GitHub Actions the same results appear as a table on the run summary.
+In GitHub Actions the same output shows up as a table on the run summary page.
 
-## Repository layout
+## Running it locally
 
-```text
-modules/            reusable building blocks, each with tests/
-  vpc/              3-tier-ready VPC, locked default SG, KMS-encrypted flow logs
-  secure-bucket/    KMS, versioning, TLS-only policy, ACLs off, lifecycle
-  kms-key/          rotation always on, scoped key policy
-  iam-role/         boundary required; service, role or GitHub OIDC trust
-  security-group/   rules as data, every rule described
-stacks/baseline/    what every environment gets (composes the modules)
-envs/{dev,staging,prod}/  identical code, different terraform.tfvars
-bootstrap/          state bucket + GitHub OIDC plan/apply roles (run once)
-policies/
-  terraform/        Rego rules
-  tests/            Rego unit tests and fixtures
-  data/env/         per-environment strictness
-  data/exceptions.yaml  time-boxed waivers
-examples/noncompliant/    insecure on purpose; CI proves it's rejected
-ci/ci_override.tf   turns any root into an offline plan
-scripts/            policy-check.sh, regression-check.sh
-```
-
-## Run the checks locally (no AWS account)
-
-Requires Terraform ≥ 1.11 (or OpenTofu), [conftest](https://www.conftest.dev), [opa](https://www.openpolicyagent.org) and [tflint](https://github.com/terraform-linters/tflint).
+You need Terraform 1.11+ (OpenTofu works too, use `TF=tofu`), conftest, opa and tflint. No AWS account needed.
 
 ```bash
-make check            # everything CI runs
-make policy ENV=prod  # one environment's guardrails
-make regression       # prove the rules still fire
+make check             # same checks as CI
+make policy ENV=prod   # just one environment
+make regression        # confirm the insecure example still gets caught
 ```
 
-## Deploy to AWS
+## Deploying to AWS
 
-> Creates billable resources. With NAT off (the default) the main cost is about $1/month per KMS key, prorated, plus a few cents of logs and storage. Run `terraform destroy` per environment when you're done.
+This creates real resources. With the NAT gateway off (the default), the cost is mostly the KMS keys at about $1/month each, plus a few cents for logs and storage. Destroy it when you're done.
 
-**1. Bootstrap (once, with admin credentials)**
+First, the bootstrap. Put your account ID in `bootstrap/terraform.tfvars`, then:
 
 ```bash
 cd bootstrap
-# set account_id in terraform.tfvars
-terraform init && terraform apply
+terraform init
+terraform apply
 terraform output
 ```
 
-**2. Point each environment at the state bucket** and set `account_id` in every `envs/*/terraform.tfvars`:
+That gives you the state bucket name and two IAM roles for GitHub Actions: a read-only one for plans and one for deploys. The deploy role can create IAM roles, but **only** if they carry one of the environment permissions boundaries. That way a compromised pipeline can't just make itself an admin role.
+
+Then for each environment, copy `backend.hcl.example` to `backend.hcl`, set `account_id` in `terraform.tfvars`, and either apply by hand:
 
 ```bash
-cp envs/dev/backend.hcl.example envs/dev/backend.hcl   # repeat for staging and prod
+cd envs/dev
+terraform init -backend-config=backend.hcl
+terraform apply
 ```
 
-**3. Deploy from your machine** (optional; the pipeline can do it instead):
+...or let GitHub Actions do it:
 
-```bash
-cd envs/dev && terraform init -backend-config=backend.hcl && terraform apply
-```
+1. Create environments `dev`, `staging` and `prod` in the repo settings. Add yourself as a required reviewer on `prod`.
+2. Add the secret `AWS_APPLY_ROLE_ARN` (from `terraform output apply_role_arn`).
+3. Add the variables `TF_STATE_BUCKET` (from `terraform output state_bucket`) and `DEPLOY_ENABLED=true`.
+4. Push to main.
 
-**4. Deploy from GitHub Actions**
+## When a rule needs an exception
 
-- Settings → Environments: create `dev`, `staging` and `prod`. Add yourself as a required reviewer on `prod`.
-- Settings → Secrets and variables → Actions:
-  - Secret `AWS_APPLY_ROLE_ARN` = `terraform -chdir=bootstrap output -raw apply_role_arn`
-  - Variable `TF_STATE_BUCKET` = `terraform -chdir=bootstrap output -raw state_bucket`
-  - Variable `DEPLOY_ENABLED` = `true`
-- Push to `main`. Dev and staging deploy, then prod waits for your approval.
-
-## Waivers
-
-Sometimes a rule has to bend, such as during a planned bucket migration. Add an entry to [`policies/data/exceptions.yaml`](policies/data/exceptions.yaml):
+Sometimes you really do need to delete a prod bucket, for example during a migration. Instead of turning the rule off, add a waiver to `policies/data/exceptions.yaml`:
 
 ```yaml
 exceptions:
@@ -174,45 +148,41 @@ exceptions:
     expires: "2026-12-01T00:00:00Z"
 ```
 
-The waiver is reviewed in the pull request like any other change. It covers only that rule on those addresses. EXC-002 rejects expiries more than 90 days out, and an expired waiver stops applying on its own.
+It only covers that one rule on those resources. It goes through PR review like anything else, and it stops working on its own after it expires. The policies also refuse waivers that are missing a reason or approver, or that last more than 90 days.
 
-## Adding a rule
+## Adding a new rule
 
-1. Add a `violations contains v if { ... }` block with a new ID to the right file in `policies/terraform/`.
-2. Add passing and failing cases in `policies/tests/`.
-3. Add a resource that breaks it to `examples/noncompliant/main.tf` and its ID to `expected-violations.txt`.
-4. Add it to the catalog above. CI enforces steps 2 and 3.
+1. Write it in `policies/terraform/` with a new ID.
+2. Add tests for the passing and failing cases in `policies/tests/`.
+3. Add something that breaks it to `examples/noncompliant/main.tf`, and the ID to `expected-violations.txt`.
 
-## Design decisions
+Step 3 is the one that matters long term. If someone later "simplifies" the rule and it stops catching that case, the regression check in CI fails.
 
-- **Policies read the plan, not the code.** Checkov reads HCL; OPA reads `terraform show -json`, which has variables resolved, modules expanded and provider defaults applied. That's how one rule can be strict in prod and relaxed in dev.
-- **Offline plans on pull requests.** Modules avoid data sources that call AWS, so `ci/ci_override.tf` (local state, fake credentials) produces a complete plan with no account at all. Forks and new contributors get the full policy gate, and CI holds no cloud credentials.
-- **Checked again before apply.** The deploy plan sees real state, so CHG-001 can spot a change that would replace a production bucket, which an offline plan can't know.
-- **The exact plan that passed is the one applied.** The binary plan is saved and passed straight to `terraform apply`.
-- **S3-native state locking** (`use_lockfile`, Terraform 1.11+) instead of a DynamoDB table, which HashiCorp has deprecated for the S3 backend.
-- **Environments differ only in data.** `envs/*` contain identical code; the differences live in `terraform.tfvars` and `policies/data/env/*.yaml`, so environments can't drift structurally.
-- **One account, prefixed names.** Fine for a demo. A real organisation would put each environment in its own AWS account and add SCPs above all of this.
+## Things I ran into
 
-### Known limits
+**Untagged resources were passing the tag check.** If a resource has no tags at all *and* the provider has no default tags, Terraform reports `tags_all` as unknown at plan time, and my first version skipped unknown values. The insecure example caught this: the VPC got flagged but the bucket, key and instance didn't. Now the rule falls back to the resource's own `tags`.
 
-- Some values are unknown until apply, such as an inline IAM policy that references a bucket ARN created in the same plan. Those rules skip unknowns, and the permissions boundary is the runtime backstop.
-- Plan JSON doesn't link resources by ID before apply, so "this bucket has a public access block" matches resources within the same module instance. The modules follow that pattern; the regression example confirms resources in different modules don't borrow each other's controls.
+**Waivers with `module.data.*` matched nothing.** OPA's `glob.match` treats `.` as a separator by default, so `*` stopped at the first dot. Passing `null` as the delimiter fixed it. I also added a test so `module.data.*` doesn't accidentally match `module.database`.
 
-### Bugs the tests caught while building this
+**Mocked providers return random strings.** `terraform test` with `mock_provider` generates random values for computed attributes, so things like `aws_iam_policy_document.json` came back as garbage and failed validation. The tests set valid placeholder values for those.
 
-- **Untagged resources were passing TAG-001.** With no tags at all, Terraform leaves `tags_all` unknown, and the first version of the rule skipped unknown values. The insecure example exposed it; the rule now falls back to the resource's own tags.
-- **Waivers like `module.data.*` matched nothing.** OPA's `glob.match` treats `.` as a separator by default. A unit test caught it, and another test now proves `module.data.*` doesn't also match `module.database`.
+**S3 state locking.** I started with the usual S3 + DynamoDB setup, then switched to `use_lockfile = true`. Terraform 1.11+ can lock in S3 directly, and the DynamoDB option is deprecated.
+
+## Limitations
+
+- Some values aren't known until apply, like an inline policy that references a bucket ARN created in the same run. The policies skip those, and the permissions boundary covers them at runtime.
+- The plan doesn't have resource IDs yet, so "does this bucket have a public access block" is matched by module. That works with how the modules are written, but it would get confused by two buckets declared side by side in one root module.
+- Everything lives in one AWS account with prefixed names. In a real setup each environment would be its own account, with SCPs on top.
 
 ## Results
 
-Fill in after deploying.
+Haven't measured these on a real deployment yet. I'll fill them in once I do.
 
-| Metric | Result |
+| | |
 |---|---|
-| Pull request policy gate duration | _TBD_ |
-| Deploy duration dev → staging (before approval) | _TBD_ |
-| Violations caught by CI on real pull requests | _TBD_ |
-| Monthly cost of all three environments | _TBD_ |
+| PR check time | |
+| Deploy time, dev to staging | |
+| Monthly cost, all three envs | |
 
 ## License
 
